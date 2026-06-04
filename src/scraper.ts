@@ -106,6 +106,16 @@ export async function scrapeTarget(options: ScrapeTargetOptions): Promise<Scrape
   }
 
   const accounts = (raw.accounts ?? []) as ScraperAccount[];
+  for (const acct of accounts) {
+    if (acct.balance != null) {
+      const b = acct.balance;
+      if (typeof b !== 'number' || isNaN(b) || !Number.isFinite(b)) {
+        const str = String(b);
+        const parsed = parseFloat(str.replace(/[^\d.-]/g, ''));
+        acct.balance = !isNaN(parsed) && Number.isFinite(parsed) ? parsed : undefined;
+      }
+    }
+  }
   const totalTxns = accounts.reduce((sum, a) => sum + (a.txns?.length ?? 0), 0);
   logger.debug(`[${options.name}] Scrape complete | accounts=${accounts.length} | txns=${totalTxns}`);
 
