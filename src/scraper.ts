@@ -1,12 +1,12 @@
 import { createScraper, CompanyTypes } from 'israeli-bank-scrapers';
 import * as path from 'path';
-import * as fs from 'fs';
 import type { ScrapeResult, ScraperAccount } from './types';
 import logger from './logger';
 
 const BROWSER_DATA_DIR = process.env.BROWSER_DATA_DIR ?? '/app/browser-data';
 const TIMEOUT_MINUTES = parseInt(process.env.TIMEOUT_MINUTES ?? '10', 10);
 const DAYS_BACK = parseInt(process.env.DAYS_BACK ?? '30', 10);
+const BROWSERLESS_URL = process.env.BROWSERLESS_URL;
 
 export interface ScrapeTargetOptions {
   companyId: string;
@@ -36,39 +36,36 @@ export async function scrapeTarget(options: ScrapeTargetOptions): Promise<Scrape
   const startDate = buildStartDate();
   const browserDataDir = path.join(BROWSER_DATA_DIR, options.companyId);
 
-  // #11 — Remove stale SingletonLock before launching the browser.
-  // Left behind when the container is killed mid-scrape; Chromium refuses to start if present.
-  const lockFile = path.join(browserDataDir, 'SingletonLock');
-  if (fs.existsSync(lockFile)) {
-    try {
-      fs.rmSync(lockFile);
-      logger.warn(`[${options.name}] Removed stale SingletonLock — previous run may have been killed`);
-    } catch (err) {
-      logger.warn(`[${options.name}] Could not remove SingletonLock: ${String(err)}`);
-    }
-  }
-
-  const scraperOptions = {
+  const commonOpts = {
     companyId: options.companyId as CompanyTypes,
     startDate,
     futureMonthsToScrape: 1,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ?? '/usr/bin/chromium',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      `--user-data-dir=${browserDataDir}`,
-    ],
     showBrowser: false,
     verbose: process.env.LOG_LEVEL === 'debug',
     defaultTimeout: timeoutMs,
     additionalTransactionInformation: options.richDetails === true,
   };
 
-  logger.debug(`[${options.name}] Launching scraper | startDate=${startDate.toISOString().substring(0, 10)} | timeout=${TIMEOUT_MINUTES}m | richDetails=${options.richDetails === true}`);
+  let scraper;
+  if (BROWSERLESS_URL) {
+    const { default: puppeteer } = await import('puppeteer-core');
+    const browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_URL });
+    scraper = createScraper({ ...commonOpts, browser, skipCloseBrowser: true });
+  } else {
+    scraper = createScraper({
+      ...commonOpts,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ?? '/usr/bin/chromium',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        `--user-data-dir=${browserDataDir}`,
+      ],
+    });
+  }
 
-  const scraper = createScraper(scraperOptions);
+  logger.debug(`[${options.name}] Launching scraper | startDate=${startDate.toISOString().substring(0, 10)} | timeout=${TIMEOUT_MINUTES}m | richDetails=${options.richDetails === true}`);
 
   const timeoutPromise = new Promise<never>((_, reject) =>
     setTimeout(
@@ -109,10 +106,15 @@ export async function scrapeTarget(options: ScrapeTargetOptions): Promise<Scrape
   for (const acct of accounts) {
     if (acct.balance != null) {
       const b = acct.balance;
-      if (typeof b !== 'number' || isNaN(b) || !Number.isFinite(b)) {
+      if (typeof b !== 'number' || !Number.isFinite(b)) {
         const str = String(b);
         const parsed = parseFloat(str.replace(/[^\d.-]/g, ''));
-        acct.balance = !isNaN(parsed) && Number.isFinite(parsed) ? parsed : undefined;
+        if (Number.isFinite(parsed)) {
+          acct.balance = parsed;
+        } else {
+          logger.warn(`[${options.name}] Dropped unparseable balance for account ${acct.accountNumber}: ${str}`);
+          acct.balance = undefined;
+        }
       }
     }
   }

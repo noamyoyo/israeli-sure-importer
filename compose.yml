@@ -4,8 +4,6 @@ services:
     image: dorko87/israeli-sure-importer:latest
     container_name: israeli-sure-importer
     restart: unless-stopped
-    # Chromium requires extra shared memory
-    shm_size: 256mb
     security_opt:
       - no-new-privileges:true
     environment:
@@ -27,9 +25,8 @@ services:
       IMPORT_PENDING: "false"
       # "true" = include future-dated transactions (default: dropped — prevents credit card scheduled charges)
       IMPORT_FUTURE: "false"
-      # Puppeteer — use system Chromium installed in the image
-      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
-      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
+      # Remote browser via browserless
+      BROWSERLESS_URL: ws://browserless:3000
       # Browser profile directory — persists 2FA device recognition per bank
       BROWSER_DATA_DIR: /app/browser-data
       # Optional: override merchants.json location (default: /app/logs/merchants.json)
@@ -59,6 +56,22 @@ services:
       # Logs
       - ./logs:/app/logs
 
+    networks:
+      - sure_net
+
     # Manual triggers via docker exec only:
     #   docker exec israeli-sure-importer node dist/index.js --run-once
     #   docker exec israeli-sure-importer node dist/index.js --run-once --dry-run
+
+  browserless:
+    image: browserless/chrome
+    restart: unless-stopped
+    environment:
+      CONNECTION_TIMEOUT: 600000
+      MAX_CONCURRENT_SESSIONS: 10
+      PREBOOT_CHROME: "true"
+    networks:
+      - sure_net
+
+networks:
+  sure_net:
