@@ -161,6 +161,35 @@ async function processTarget(
     totalFuture += txResult.futureSkipped;
     totalPending += txResult.pendingSkipped;
 
+    // Observability — always log the raw scraped balance per account, independent of the
+    // reconcile/null/API-fail branches below. Distinguishes "scraper returned no balance"
+    // from "reconcile disabled" from "valuation POST failed" at a glance.
+    logger.info(
+      `[${target.name}] account=${account.accountNumber} | balance=${account.balance ?? 'null'}` +
+      ` | reconcile=${target.reconcile === true}`
+    );
+
+    // Reconciliation — post valuation whenever balance is available, even if no new transactions.
+    // Must run before the newCount===0 early-exit so stale balances are not left in Sure when
+    // all transactions are already deduped.
+    if (!dryRun) {
+      const balance = account.balance;
+      if (target.reconcile && balance != null && Number.isFinite(balance)) {
+        try {
+          const todayISO = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Jerusalem' });
+          await createValuation({ account_id: sureAccount.id, date: todayISO, amount: balance });
+          logger.info(`[${target.name}] Reconciled balance: ${balance}`);
+          didReconcile = true;
+        } catch (valErr) {
+          const detail = (valErr as { response?: { data?: unknown } })?.response?.data;
+          logger.warn(
+            `[${target.name}] Reconciliation failed (non-fatal): ${String(valErr)}` +
+            (detail ? ` | response: ${JSON.stringify(detail)}` : '')
+          );
+        }
+      }
+    }
+
     if (newCount === 0) continue;
 
     if (dryRun) {
@@ -213,23 +242,6 @@ async function processTarget(
 
     totalNewTx += txSuccessCount;
     totalTxFailed += txFailCount;
-
-    // Reconciliation — post valuation when target.reconcile and balance is available
-    const balance = account.balance;
-    if (target.reconcile && balance != null && Number.isFinite(balance)) {
-      try {
-        const todayISO = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Jerusalem' });
-        await createValuation({ account_id: sureAccount.id, date: todayISO, amount: balance });
-        logger.info(`[${target.name}] Reconciled balance: ${balance}`);
-        didReconcile = true;
-      } catch (valErr) {
-        const detail = (valErr as { response?: { data?: unknown } })?.response?.data;
-        logger.warn(
-          `[${target.name}] Reconciliation failed (non-fatal): ${String(valErr)}` +
-          (detail ? ` | response: ${JSON.stringify(detail)}` : '')
-        );
-      }
-    }
   }
 
   // Post-loop: always write a history entry after a real run so every
@@ -297,7 +309,9 @@ async function run(): Promise<void> {
   clearEntityCaches();
   initNotifier(secrets.telegramBotToken);
 
-  // Process each target sequentially — one bank failing does not stop the others
+  // Process each target sequentially — one bank failing does not stop the others.
+  // Parallel scraping is unsafe because multiple targets share the same Chromium
+  // profile directory (e.g. visaCal for multiple Cal cards), causing browser lock conflicts.
   const allStats: TargetStats[] = [];
   let totalImported = 0;
   let successCount = 0;
@@ -318,7 +332,6 @@ async function run(): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error(`[${target.name}] Pipeline failed: ${errMsg}`);
-      // AlreadyNotifiedError: scraper notified Telegram — skip duplicate alert
       if (!(err instanceof AlreadyNotifiedError)) {
         await notifySyncFail(target.name, errMsg);
       }
