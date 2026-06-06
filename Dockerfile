@@ -19,8 +19,14 @@ RUN npm prune --omit=dev
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM node:22-slim AS runtime
 
-ENV NODE_ENV=production \
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    NODE_ENV=production \
     TZ=Asia/Jerusalem
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      chromium \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

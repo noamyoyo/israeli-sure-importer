@@ -1,12 +1,12 @@
 import { createScraper, CompanyTypes } from 'israeli-bank-scrapers';
 import * as path from 'path';
+import * as fs from 'fs';
 import type { ScrapeResult, ScraperAccount } from './types';
 import logger from './logger';
 
 const BROWSER_DATA_DIR = process.env.BROWSER_DATA_DIR ?? '/app/browser-data';
 const TIMEOUT_MINUTES = parseInt(process.env.TIMEOUT_MINUTES ?? '10', 10);
 const DAYS_BACK = parseInt(process.env.DAYS_BACK ?? '30', 10);
-const BROWSERLESS_URL = process.env.BROWSERLESS_URL;
 
 export interface ScrapeTargetOptions {
   companyId: string;
@@ -46,24 +46,26 @@ export async function scrapeTarget(options: ScrapeTargetOptions): Promise<Scrape
     additionalTransactionInformation: options.richDetails === true,
   };
 
-  let scraper;
-  if (BROWSERLESS_URL) {
-    const { default: puppeteer } = await import('puppeteer-core');
-    const browser = await puppeteer.connect({ browserWSEndpoint: BROWSERLESS_URL });
-    scraper = createScraper({ ...commonOpts, browser, skipCloseBrowser: true });
-  } else {
-    scraper = createScraper({
-      ...commonOpts,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ?? '/usr/bin/chromium',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        `--user-data-dir=${browserDataDir}`,
-      ],
-    });
+    let scraper;
+
+  // Clean stale SingletonLock from previous runs
+  const lockFile = path.join(browserDataDir, 'SingletonLock');
+  if (fs.existsSync(lockFile)) {
+    try { fs.rmSync(lockFile); logger.warn(`[${options.name}] Removed stale SingletonLock`); }
+    catch (err) { logger.warn(`[${options.name}] Could not remove SingletonLock: ${String(err)}`); }
   }
+
+  scraper = createScraper({
+    ...commonOpts,
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH ?? '/usr/bin/chromium',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      `--user-data-dir=${browserDataDir}`,
+    ],
+  });
 
   logger.debug(`[${options.name}] Launching scraper | startDate=${startDate.toISOString().substring(0, 10)} | timeout=${TIMEOUT_MINUTES}m | richDetails=${options.richDetails === true}`);
 
