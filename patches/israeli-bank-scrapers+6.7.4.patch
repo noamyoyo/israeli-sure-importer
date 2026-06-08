@@ -19,7 +19,7 @@ index 4e821fa..f47be55 100644
  }
  function getTxnAmount(txn) {
 diff --git a/node_modules/israeli-bank-scrapers/lib/scrapers/max.js b/node_modules/israeli-bank-scrapers/lib/scrapers/max.js
-index ab8e48d..ca81bb1 100644
+index ab8e48d..8b3a782 100644
 --- a/node_modules/israeli-bank-scrapers/lib/scrapers/max.js
 +++ b/node_modules/israeli-bank-scrapers/lib/scrapers/max.js
 @@ -117,7 +117,8 @@ function getTransactionType(planName, planTypeId) {
@@ -32,3 +32,22 @@ index ab8e48d..ca81bb1 100644
        }
    }
  }
+@@ -217,7 +218,17 @@ function prepareTransactions(txns, startMoment, combineInstallments, enableTrans
+     clonedTxns = (0, _transactions.fixInstallments)(clonedTxns);
+   }
+   clonedTxns = (0, _transactions.sortTransactionsByDate)(clonedTxns);
+-  clonedTxns = enableTransactionsFilterByDate ? (0, _transactions.filterOldTransactions)(clonedTxns, startMoment, combineInstallments || false) : clonedTxns;
++  if (enableTransactionsFilterByDate) {
++    clonedTxns = clonedTxns.filter(txn => {
++      // For recurring loans the purchaseDate is months/years in the past; use
++      // processedDate (bank charge date) when the gap exceeds 100 days so these
++      // installments are not dropped by the start-date filter.
++      const dateToCheck = txn.processedDate &&
++        new Date(txn.processedDate) - new Date(txn.date) > 100 * 86400 * 1000
++          ? txn.processedDate : txn.date;
++      return startMoment.isSameOrBefore(dateToCheck);
++    });
++  }
+   return clonedTxns;
+ }
+ async function fetchTransactions(page, options) {

@@ -38,10 +38,24 @@ function buildSourceId(
   const datePart = tx.date.substring(0, 10);
   const id = tx.identifier != null ? String(tx.identifier) : null;
   if (id && id !== '0') {
-    return `${companyId}:${accountNumber}:${datePart}:${id}`;
+    // Recurring loan installments share the same ARN and purchase date every month.
+    // When the charge date is >100 days after the purchase date, include the charge
+    // month so each monthly payment gets a unique key instead of deduplicating against
+    // the first import.
+    const chargeMon = tx.processedDate?.substring(0, 7);
+    const isLongGap = tx.processedDate && tx.date &&
+      new Date(tx.processedDate).getTime() - new Date(tx.date).getTime() > 100 * 86400 * 1000;
+    const suffix = chargeMon && isLongGap ? `:${chargeMon}` : '';
+    return `${companyId}:${accountNumber}:${datePart}:${id}${suffix}`;
   }
+  // For recurring loans without an ARN, include the charge month so each monthly
+  // payment gets a unique key rather than deduplicating against the first import.
+  const chargeMon = tx.processedDate?.substring(0, 7);
+  const isLongGap = tx.processedDate && tx.date &&
+    new Date(tx.processedDate).getTime() - new Date(tx.date).getTime() > 100 * 86400 * 1000;
+  const chargePart = chargeMon && isLongGap && !tx.installments ? `:${chargeMon}` : '';
   const fallback = [datePart, tx.chargedAmount, tx.description, tx.installments?.number ?? 0].join(':');
-  return `${companyId}:${accountNumber}:${fallback}`;
+  return `${companyId}:${accountNumber}:${fallback}${chargePart}`;
 }
 
 /**
