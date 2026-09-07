@@ -106,7 +106,9 @@ export function initSureClient(baseUrl: string, apiKey: string): void {
   client = axios.create({
     baseURL: baseUrl,
     headers: { 'X-Api-Key': apiKey },
-    timeout: 30_000,
+    // Ha-Benleumi's dedup fetch (largest account) routinely runs ~31s and was
+    // tripping the old 30s cap, failing the whole nightly run. Env-tunable.
+    timeout: Number(process.env.SURE_API_TIMEOUT_MS) || 120_000,
   });
   install429Interceptor(client);
 }
@@ -170,7 +172,11 @@ export const IMPORT_MARKER = 'Imported by israeli-banks-sure-importer';
 
 function extractSourceId(notes: string | undefined): string | undefined {
   if (!notes?.includes(IMPORT_MARKER)) return undefined;
-  const match = /^Source ID: (.+)$/m.exec(notes);
+  // sourceId can itself contain embedded newlines (raw bank descriptions sometimes
+  // do, e.g. "...\n(תאריך ערך 10/07)"), so anchor to the next known field instead of
+  // relying on end-of-line — a plain `.` (even multiline `$`) would truncate at the
+  // first embedded newline and silently break dedup for those transactions.
+  const match = /^Source ID: ([\s\S]+?)\nSource bank:/m.exec(notes);
   return match?.[1]?.trim();
 }
 

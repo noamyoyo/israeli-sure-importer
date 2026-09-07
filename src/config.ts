@@ -19,6 +19,12 @@ export interface Target {
   accounts?: 'all' | string[];  // filter to specific bank account numbers; default = 'all'
   richDetails?: boolean;  // opt-in: pass additionalTransactionInformation to scraper (only Mizrahi/Hapoalim use it)
   bankAlias?: string;     // optional display label for "Source bank:" in notes; does not affect sourceId or dedup
+  // Per-target override for the global IMPORT_PENDING env flag. Some banks (Beinleumi)
+  // don't assign a stable identifier until a transaction settles — a pending-status import
+  // gets a fallback sourceId, then the same transaction re-imports under a different
+  // identifier-based sourceId once it posts, creating a permanent duplicate. Set false here
+  // for any bank where pending transactions lack a stable identifier.
+  importPending?: boolean;
 }
 
 export interface Config {
@@ -78,6 +84,7 @@ const schema = {
           },
           richDetails: { type: 'boolean' },
           bankAlias: { type: 'string', minLength: 1 },
+          importPending: { type: 'boolean' },
         },
       },
     },

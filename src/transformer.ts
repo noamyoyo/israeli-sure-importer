@@ -225,10 +225,23 @@ export function transform(
     // transaction currency, since that would misrepresent the charged amount.
     const currency = 'ILS';
 
+    // Recurring loan installments (Max) always report tx.date as the loan's
+    // origination date, never the actual per-cycle charge date — every monthly
+    // installment lands in Sure dated to when the loan was taken out. This makes
+    // "current balance since date X" queries silently invisible to them (the
+    // literal cause of two separate balance corrections on Max-8345/Max-3727).
+    // The real per-cycle date is available separately as tx.processedDate — use
+    // it for installment rows specifically. Non-installment transactions keep
+    // tx.date unchanged (their date/processedDate gap is purchase-vs-settlement,
+    // not this bug, and shouldn't be touched).
+    const entryDate = tx.installments && tx.processedDate
+      ? tx.processedDate.substring(0, 10)
+      : tx.date.substring(0, 10);
+
     rows.push({
       name,
       notes,
-      date: tx.date.substring(0, 10),
+      date: entryDate,
       amount: tx.chargedAmount,
       currency,
       sourceId,
