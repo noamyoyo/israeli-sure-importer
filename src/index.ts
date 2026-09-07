@@ -18,6 +18,7 @@ import { scrapeTarget } from './scraper';
 import { reloadMerchants } from './merchants';
 import { transform } from './transformer';
 import { appendHistory } from './history';
+import { archiveScrape, writeManifest, type ManifestTarget } from './raw-archive';
 
 // Route library console.warn through the importer logger
 console.warn = (...args: unknown[]) => logger.warn(args.map(String).join(' '));
@@ -70,6 +71,9 @@ interface TargetStats {
   pendingSkipped: number;
   reconciled: boolean;
   error: boolean;
+  errorMsg?: string;                          // populated on a caught pipeline failure
+  seconds?: number;                           // scrape wall time (for the raw-archive manifest)
+  balances?: Record<string, number | null>;   // scraped balance per account number (manifest)
 }
 
 async function processTarget(
@@ -129,6 +133,11 @@ async function processTarget(
     throw new AlreadyNotifiedError(`Scraper failed: ${scrapeResult.errorType}`);
   }
 
+  // Sure-free pipeline (P0): archive the verbatim scrape result before any transform.
+  // No-op unless RAW_ARCHIVE_DIR is set. Runs on a good scrapeResult only, incl. dry runs
+  // (raw capture is read-only — nothing writes to Sure from it).
+  archiveScrape(target.name, target.companyId, scrapeResult.accounts);
+
   let totalScraped = 0;
   let totalNewTx = 0;
   let totalTxFailed = 0;
@@ -136,6 +145,7 @@ async function processTarget(
   let totalFuture = 0;
   let totalPending = 0;
   let didReconcile = false;
+  const balances: Record<string, number | null> = {};
 
   // Build the set of wanted account numbers (undefined / 'all' = accept everything)
   const accountFilter = target.accounts && target.accounts !== 'all'
@@ -147,7 +157,8 @@ async function processTarget(
       logger.debug(`[${target.name}] Skipping account ${account.accountNumber} — not in target.accounts filter`);
       continue;
     }
-    const txResult = transform(account.txns, account.accountNumber, target.companyId, importPending, existingIds, importFuture, target.bankAlias);
+    const effectiveImportPending = target.importPending ?? importPending;
+    const txResult = transform(account.txns, account.accountNumber, target.companyId, effectiveImportPending, existingIds, importFuture, target.bankAlias);
     const newCount = txResult.rows.length;
 
     logger.info(
@@ -160,6 +171,7 @@ async function processTarget(
     totalDedup += txResult.alreadySeenSkipped;
     totalFuture += txResult.futureSkipped;
     totalPending += txResult.pendingSkipped;
+    balances[String(account.accountNumber)] = account.balance ?? null;
 
     // Observability — always log the raw scraped balance per account, independent of the
     // reconcile/null/API-fail branches below. Distinguishes "scraper returned no balance"
@@ -270,6 +282,8 @@ async function processTarget(
     pendingSkipped: totalPending,
     reconciled: didReconcile,
     error: false,
+    seconds: elapsedSecs,
+    balances,
   };
 }
 
@@ -336,9 +350,22 @@ async function run(): Promise<void> {
         await notifySyncFail(target.name, errMsg);
       }
       failCount++;
-      allStats.push({ bank: target.name, scraped: 0, newTx: 0, txFailed: 0, dedupSkipped: 0, futureSkipped: 0, pendingSkipped: 0, reconciled: false, error: true });
+      allStats.push({ bank: target.name, scraped: 0, newTx: 0, txFailed: 0, dedupSkipped: 0, futureSkipped: 0, pendingSkipped: 0, reconciled: false, error: true, errorMsg: errMsg });
     }
   }
+
+  // Sure-free pipeline (P0): per-run manifest alongside the raw archive. No-op unless
+  // RAW_ARCHIVE_DIR is set. ingest.py reads this first — an ok:false target is recorded
+  // stale, never silently skipped.
+  writeManifest(allStats.map((s): ManifestTarget => ({
+    name: s.bank,
+    ok: !s.error,
+    error: s.errorMsg,
+    seconds: s.seconds,
+    scraped: s.scraped,
+    newTx: s.newTx,
+    balances: s.balances,
+  })));
 
   // Build per-bank summary lines for Telegram
   const bankLines = allStats.map(s => {
