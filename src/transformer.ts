@@ -1,5 +1,5 @@
 import type { Transaction } from './types';
-import { IMPORT_MARKER } from './sure-client';
+import { IMPORT_MARKER, contentKey } from './sure-client';
 import { findMatch } from './merchants';
 import logger from './logger';
 
@@ -173,6 +173,12 @@ function buildNotes(
  *   2. Future-date  — dropped unless importFuture is true
  *   3. Pending      — dropped unless importPending is true
  *   4. Dedup        — dropped if sourceId already in existingIds (Sure-side set)
+ *   5. Content dedup — only when this transaction has no bank identifier (the sourceId
+ *      fallback branch): dropped if a stored transaction already matches on
+ *      date + |amount| + matched name. Guards against the case where the bank returns an
+ *      identifier on one scrape and omits it on another for the same real transaction —
+ *      sourceId alone can't catch that since the two computed keys never match (see
+ *      the Max-8345 duplicate loan-disbursement incident, 2026-09).
  */
 export function transform(
   txns: Transaction[],
@@ -182,6 +188,7 @@ export function transform(
   existingIds: Map<string, string>,
   importFuture: boolean = false,
   bankAlias?: string,
+  existingContentKeys?: Set<string>,
 ): TransformResult {
   let zeroAmountSkipped = 0;
   let futureSkipped = 0;
@@ -237,6 +244,17 @@ export function transform(
     const entryDate = tx.installments && tx.processedDate
       ? tx.processedDate.substring(0, 10)
       : tx.date.substring(0, 10);
+
+    // 5. Content-fingerprint fallback — only fires for the no-identifier branch of
+    // buildSourceId, since that's the only case where a flip in identifier presence
+    // across scrapes can produce a non-matching sourceId for the same real transaction.
+    const rawId = tx.identifier != null ? String(tx.identifier) : null;
+    const hasIdentifier = !!rawId && rawId !== '0';
+    if (!hasIdentifier && existingContentKeys?.has(contentKey(entryDate, Math.round(tx.chargedAmount * 100), name))) {
+      alreadySeenSkipped++;
+      logger.debug(`[${companyId}] Deduped (content fingerprint, no bank identifier): "${name}" | date=${entryDate} | amount=${tx.chargedAmount}`);
+      continue;
+    }
 
     rows.push({
       name,

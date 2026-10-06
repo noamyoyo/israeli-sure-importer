@@ -211,15 +211,32 @@ export async function resolveAccount(idOrName: string): Promise<SureAccount> {
   return found;
 }
 
+export interface ExistingTransactions {
+  sourceIds: Map<string, string>; // sourceId -> processedDate
+  contentKeys: Set<string>;       // "date:|amount_cents|:name" — magnitude-only fallback fingerprint
+}
+
+/** Builds the magnitude-only content fingerprint used by the fallback dedup check. */
+export function contentKey(date: string, amountCents: number, name: string): string {
+  return `${date}:${Math.abs(amountCents)}:${name}`;
+}
+
 /**
- * Returns a Map<sourceId, processedDate> for all previously-imported transactions.
- * The date is extracted from the "Processed date:" line in notes and used for
- * date-aware dedup: prevents false-positive dedup when a bank reuses the same
- * identifier for different months (e.g. Mizrahi recurring salary).
+ * Returns previously-imported transactions for an account, indexed two ways:
+ *   - sourceIds: the primary Map<sourceId, processedDate>, extracted from the "Processed date:"
+ *     line in notes, used for date-aware dedup (prevents false-positive dedup when a bank
+ *     reuses the same identifier for different months, e.g. Mizrahi recurring salary).
+ *   - contentKeys: a magnitude-only fallback fingerprint (date + |amount| + matched name), used
+ *     only when the current scrape's transaction has no bank identifier — the exact scenario
+ *     that let the same real transaction (a Max-8345 loan disbursement, 2026-09) get imported
+ *     twice: the bank returned its identifier on one scrape and omitted it on another, so the
+ *     two computed sourceIds never matched even though it was the same transaction. Magnitude
+ *     (not signed amount) deliberately, to avoid depending on the sign convention matching
+ *     exactly between the scraper's chargedAmount and Sure's stored signed_amount_cents.
  * Result is NOT cached — called once per target account per run.
  */
-export async function listImportedTransactionIds(accountId: string): Promise<Map<string, string>> {
-  interface SureTx { notes?: string }
+export async function listImportedTransactionIds(accountId: string): Promise<ExistingTransactions> {
+  interface SureTx { notes?: string; date?: string; amount_cents?: number; name?: string }
 
   const transactions = await listPaginatedCollection<SureTx>(
     '/api/v1/transactions',
@@ -227,7 +244,8 @@ export async function listImportedTransactionIds(accountId: string): Promise<Map
     { account_id: accountId, search: IMPORT_MARKER }
   );
 
-  const ids = new Map<string, string>();
+  const sourceIds = new Map<string, string>();
+  const contentKeys = new Set<string>();
   for (const tx of transactions) {
     const sid = extractSourceId(tx.notes);
     if (!sid) continue;
@@ -235,11 +253,15 @@ export async function listImportedTransactionIds(accountId: string): Promise<Map
     if (date === undefined) {
       logger.warn(`[sure-client] Transaction with sourceId "${sid}" has no Processed date — v1 dedup will not apply; transaction may be re-imported`);
     }
-    ids.set(sid, date ?? '');
+    sourceIds.set(sid, date ?? '');
+
+    if (tx.date && tx.amount_cents != null && tx.name) {
+      contentKeys.add(contentKey(tx.date, tx.amount_cents, tx.name));
+    }
   }
 
-  logger.debug(`[sure-client] listImportedTransactionIds: found ${ids.size} existing sourceIds for account ${accountId}`);
-  return ids;
+  logger.debug(`[sure-client] listImportedTransactionIds: found ${sourceIds.size} existing sourceIds, ${contentKeys.size} content fingerprints for account ${accountId}`);
+  return { sourceIds, contentKeys };
 }
 
 /**

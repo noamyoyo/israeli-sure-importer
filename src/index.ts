@@ -7,6 +7,7 @@ import {
   clearEntityCaches,
   resolveAccount,
   listImportedTransactionIds,
+  contentKey,
   resolveCategory,
   ensureTags,
   createTransaction,
@@ -18,7 +19,7 @@ import { scrapeTarget } from './scraper';
 import { reloadMerchants } from './merchants';
 import { transform } from './transformer';
 import { appendHistory } from './history';
-import { archiveScrape, writeManifest, type ManifestTarget } from './raw-archive';
+import { archiveScrape, writeManifest, beginArchiveRun, assertArchiveReady, type ManifestTarget } from './raw-archive';
 
 // Route library console.warn through the importer logger
 console.warn = (...args: unknown[]) => logger.warn(args.map(String).join(' '));
@@ -98,8 +99,8 @@ async function processTarget(
 
   // Fetch existing sourceIds from Sure (dedup set)
   logger.info(`[${target.name}] Fetching existing transaction IDs from Sure (dedup)...`);
-  const existingIds = await listImportedTransactionIds(sureAccount.id);
-  logger.debug(`[${target.name}] Dedup: ${existingIds.size} existing sourceIds in Sure (Map<sourceId, date>)`);
+  const { sourceIds: existingIds, contentKeys: existingContentKeys } = await listImportedTransactionIds(sureAccount.id);
+  logger.debug(`[${target.name}] Dedup: ${existingIds.size} existing sourceIds, ${existingContentKeys.size} content fingerprints in Sure`);
 
   // Scrape — log elapsed time per bank; alert if approaching timeout
   const scrapeStart = Date.now();
@@ -133,9 +134,9 @@ async function processTarget(
     throw new AlreadyNotifiedError(`Scraper failed: ${scrapeResult.errorType}`);
   }
 
-  // Sure-free pipeline (P0): archive the verbatim scrape result before any transform.
-  // No-op unless RAW_ARCHIVE_DIR is set. Runs on a good scrapeResult only, incl. dry runs
-  // (raw capture is read-only — nothing writes to Sure from it).
+  // Archive the verbatim scrape result before any transform. Runs on a good scrapeResult only,
+  // incl. dry runs (raw capture is read-only). Throws if it cannot be written: a scrape that was
+  // not archived must not look successful (the target is marked failed in the manifest).
   archiveScrape(target.name, target.companyId, scrapeResult.accounts);
 
   let totalScraped = 0;
@@ -158,7 +159,7 @@ async function processTarget(
       continue;
     }
     const effectiveImportPending = target.importPending ?? importPending;
-    const txResult = transform(account.txns, account.accountNumber, target.companyId, effectiveImportPending, existingIds, importFuture, target.bankAlias);
+    const txResult = transform(account.txns, account.accountNumber, target.companyId, effectiveImportPending, existingIds, importFuture, target.bankAlias, existingContentKeys);
     const newCount = txResult.rows.length;
 
     logger.info(
@@ -245,6 +246,7 @@ async function processTarget(
           tag_ids: tagIds.length ? tagIds : undefined,
         });
         existingIds.set(tx.sourceId, tx.date);
+        existingContentKeys.add(contentKey(tx.date, Math.round(tx.amount * 100), tx.name));
         txSuccessCount++;
       } catch (txErr) {
         logger.error(`[${target.name}] Failed to create transaction "${tx.name}": ${String(txErr)}`);
@@ -291,6 +293,7 @@ async function processTarget(
 
 async function run(): Promise<void> {
   logger.info('=== Run started ===');
+  beginArchiveRun(); // new run id: raw files of this run never overwrite an earlier run's
   reloadMerchants(); // re-read merchants.json on each run; picks up edits without restart
   if (dryRun) logger.info('[DRY RUN] mode — no Sure API writes will be made');
 
@@ -323,6 +326,18 @@ async function run(): Promise<void> {
   clearEntityCaches();
   initNotifier(secrets.telegramBotToken);
 
+  // FAIL CLOSED: no raw archive, no run. The archive silently stopped for 12 days once
+  // (2026-09-25..10-06) because this check did not exist. Nothing is scraped or written to Sure
+  // unless the archive directory is configured and writable.
+  try {
+    assertArchiveReady();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`Raw archive not ready — aborting run: ${msg}`);
+    await notifySyncFail('raw-archive', msg);
+    throw new Error(`Raw archive not ready: ${msg}`);
+  }
+
   // Process each target sequentially — one bank failing does not stop the others.
   // Parallel scraping is unsafe because multiple targets share the same Chromium
   // profile directory (e.g. visaCal for multiple Cal cards), causing browser lock conflicts.
@@ -354,18 +369,25 @@ async function run(): Promise<void> {
     }
   }
 
-  // Sure-free pipeline (P0): per-run manifest alongside the raw archive. No-op unless
-  // RAW_ARCHIVE_DIR is set. ingest.py reads this first — an ok:false target is recorded
-  // stale, never silently skipped.
-  writeManifest(allStats.map((s): ManifestTarget => ({
-    name: s.bank,
-    ok: !s.error,
-    error: s.errorMsg,
-    seconds: s.seconds,
-    scraped: s.scraped,
-    newTx: s.newTx,
-    balances: s.balances,
-  })));
+  // Per-run manifest alongside the raw archive (timestamped, never overwritten; carries the
+  // scraper/node/chromium versions). Consumers read this first — an ok:false target is recorded
+  // stale, never silently skipped. A write failure is surfaced after the summary below.
+  let manifestError: Error | null = null;
+  try {
+    writeManifest(allStats.map((s): ManifestTarget => ({
+      name: s.bank,
+      ok: !s.error,
+      error: s.errorMsg,
+      seconds: s.seconds,
+      scraped: s.scraped,
+      newTx: s.newTx,
+      balances: s.balances,
+    })));
+  } catch (err) {
+    manifestError = err instanceof Error ? err : new Error(String(err));
+    logger.error(`Raw manifest write failed: ${manifestError.message}`);
+    await notifySyncFail('raw-archive', `manifest write failed: ${manifestError.message}`);
+  }
 
   // Build per-bank summary lines for Telegram
   const bankLines = allStats.map(s => {
@@ -394,6 +416,7 @@ async function run(): Promise<void> {
   }
 
   logger.info('=== Run finished ===');
+  if (manifestError) throw manifestError; // non-zero exit for --run-once; logged in scheduled mode
 }
 
 // --- Graceful shutdown ---
@@ -445,5 +468,7 @@ process.on('SIGINT',  () => handleShutdown('SIGINT'));
 
 main().catch(err => {
   logger.error('Fatal error', { error: err instanceof Error ? err.message : String(err) });
-  process.exit(1);
+  // Non-zero exit, but let Winston file transports flush first (same pattern as the success path).
+  process.exitCode = 1;
+  setTimeout(() => process.exit(1), 3000).unref();
 });
